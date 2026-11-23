@@ -22,3 +22,6 @@ Thumbs.db
 
 # secrets
 .env
+
+# fast-mode output and uv
+results_fast/
