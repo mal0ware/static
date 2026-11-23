@@ -341,4 +341,4 @@ Everything that was run is in `results/`. Nothing was dropped.
   paper.
 - Laloux et al. (2000), the paper PK and PBL credit for clipping, was not read.
 - The CKM boundary was compared with their Fig. 2 by eye only.
-- The CI workflow has not been seen to run on GitHub.
+- The CI workflow did not run on GitHub: the job was refused with "recent account payments have failed or your spending limit needs to be increased". The same steps pass locally on Windows.
