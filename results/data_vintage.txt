@@ -1,3 +1,8 @@
 industries49: This file was created using the 202609 CRSP database. Last day 2026-09-30.
 size_bm_100: This file was created using the 202609 CRSP database. Last day 2026-09-30.
 factors: This file was created by using the 202609 CRSP database. Last day 2026-09-30.
+stocks: Zenodo 10.5281/zenodo.23933497, 628 tickers, 2000-01-04 to 2026-10-29.
+stocks/logret.parquet: sha256 41796aed68ab4f61a7bc98697ef60f5c5076aba68309ff0cd160802d25700a52
+stocks/membership_daily.parquet: sha256 6d61ed1021c6d509f43d0b4740dcdc4cc08dd3e42bd47b41781ad95c032a00a9
+stocks/coverage_by_year.csv: sha256 7518a4e82c33446221133ef5d667efd097135f99d16da8f1d0b7ee9a61c8304d
+stocks/collection_log.csv: sha256 b6192207746fcf4c8ccba39a83238a1b3a8b12a45e1146192c0b4c6432dcbb81

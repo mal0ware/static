@@ -115,3 +115,14 @@ def test_fitted_edge_never_keeps_fewer_than_the_plain_edge() -> None:
     x, _ = planted(80, 400, 0.8, 9)
     values, _ = sorted_eigh(sample_correlation(x))
     assert count_signal(values, 5.0, fit=True) >= count_signal(values, 5.0)
+
+
+def test_a_precomputed_spectrum_gives_the_same_matrix() -> None:
+    from static.cleaning import clip_covariance, correlation_from_covariance, sample_covariance
+
+    rng = np.random.default_rng(11)
+    cov = sample_covariance(rng.standard_normal((90, 30)) + rng.standard_normal((90, 1)))
+    spectrum = sorted_eigh(correlation_from_covariance(cov))
+    for fit in (False, True):
+        direct = clip_covariance(cov, 3.0, fit=fit)
+        assert np.array_equal(direct, clip_covariance(cov, 3.0, fit=fit, spectrum=spectrum))

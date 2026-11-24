@@ -4,17 +4,24 @@
     uv run python scripts/reproduce.py          # full run, writes results/
     uv run python scripts/reproduce.py --fast   # smoke run, writes results_fast/
 
-The full run takes several minutes. The fast run uses smaller simulations and finishes in
+The full run takes 15 to 20 minutes. The fast run uses smaller simulations and finishes in
 well under two minutes; its numbers are noisier and are not the ones quoted in the README.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+# The matrices here are a few hundred wide. On a machine with many cores the linear
+# algebra library spends far longer handing such small jobs to its threads than doing
+# them, so the thread count is capped unless the caller has set it.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
 
 import matplotlib
 
@@ -25,9 +32,17 @@ import pandas as pd
 
 from static import experiments as ex
 from static.cleaning import sample_correlation, sorted_eigh
-from static.data import FILES, load, vintage
+from static.data import (
+    FILES,
+    STOCK_FILES,
+    STOCKS_DOI,
+    load,
+    load_stocks,
+    stock_coverage,
+    vintage,
+)
 from static.feasibility import ml_feasible_probability
-from static.mp import mp_bounds, mp_cdf, mp_pdf
+from static.mp import fit_noise_variance, mp_bounds, mp_cdf, mp_pdf
 from static.portfolio import q0_theory, q1_theory
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -201,17 +216,25 @@ def fig_mp_real(universes: dict[str, Any], out: Path) -> None:
     finish(fig, out, "fig3_mp_real")
 
 
-def fig_clipping_real(table: Any, out: Path) -> None:
-    titles = {
-        "industries49": "49 industry portfolios",
-        "size_bm_100": "size and book-to-market portfolios",
-    }
-    fig, axes = plt.subplots(1, 2, figsize=(9.6, 4.2), sharey=True)
-    for ax, (name, group) in zip(axes, table.groupby("universe", sort=False), strict=True):
+MIN_VARIANCE_TITLES = {
+    "industries49": "49 industry portfolios",
+    "size_bm_100": "size and book-to-market portfolios",
+    "sp500_stocks": "S&P 500 stocks",
+}
+
+
+def fig_min_variance(table: Any, out: Path, name: str) -> None:
+    groups = list(table.groupby("universe", sort=False))
+    fig, axes = plt.subplots(
+        1, len(groups), figsize=(max(6.4, 4.8 * len(groups)), 4.2), sharey=True, squeeze=False
+    )
+    for ax, (universe, group) in zip(axes[0], groups, strict=True):
         equal = group[group["method"] == "equal weight"]["realised_vol_pct"].iloc[0]
         ax.axhline(equal, color=MUTED, lw=1.4, ls=":", label="equal weight")
-        for k, method in enumerate(["raw", "clipped", "clipped, fitted edge"]):
-            rows = group[(group["method"] == method) & (group["rebalances"] > 0)]
+        for k, method in enumerate(["raw", "clipped", "clipped, fitted edge", "ledoit-wolf"]):
+            rows = group[
+                (group["method"] == method) & (group["rebalances"] == group["rebalances_possible"])
+            ]
             ax.plot(
                 rows["N/T"],
                 rows["realised_vol_pct"],
@@ -225,11 +248,53 @@ def fig_clipping_real(table: Any, out: Path) -> None:
         ticks = sorted(group["N/T"].unique())
         ax.set_xticks(ticks, [f"{v:.2f}" for v in ticks])
         ax.minorticks_off()
-        ax.set_xlabel("assets per observation, N/T (log scale)")
-        ax.set_title(f"{titles[name]}, N = {group['N'].iloc[0]}")
-    axes[0].set_ylabel("realised volatility, % a year")
-    axes[0].legend(loc="upper left")
-    finish(fig, out, "fig4_clipping_real")
+        ax.set_xlabel("assets per observation, mean N/T (log scale)")
+        ax.set_title(f"{MIN_VARIANCE_TITLES[universe]}, mean N = {group['N_mean'].iloc[0]:.0f}")
+    axes[0][0].set_ylabel("realised volatility, % a year")
+    axes[0][0].legend(loc="best")
+    finish(fig, out, name)
+
+
+def fig_stock_spectrum(returns: Any, member: Any, out: Path) -> None:
+    windows = ex.stock_windows(returns, member)
+    picks = [windows[0][0], windows[-1][0]]
+    fig, axes = plt.subplots(1, 2, figsize=(9.6, 4.2))
+    for ax, window in zip(axes, picks, strict=True):
+        x = window.to_numpy(dtype=np.float64)
+        t, n = x.shape
+        values = sorted_eigh(sample_correlation(x))[0]
+        first = 1.0 - values[0] / n
+        fit = fit_noise_variance(values, t / n)
+        top = 1.6 * mp_bounds(t / n)[1]
+        shown = values[values <= top]
+        ax.hist(
+            shown,
+            bins=np.linspace(0.0, top, 61),
+            weights=np.full(shown.size, 1.0 / n),
+            color="#9ec5f4",
+            edgecolor=SURFACE,
+            linewidth=0.5,
+            label=f"measured, {n - shown.size} of {n} beyond the axis",
+        )
+        width = top / 60
+        cases = [(first, "market mode removed"), (fit.sigma2, "fitted")]
+        for k, (sigma2, label) in enumerate(cases):
+            lo, hi = mp_bounds(t / n, sigma2)
+            grid = np.linspace(lo, hi, 2000)
+            ax.plot(
+                grid,
+                mp_pdf(grid, t / n, sigma2) * width,
+                color=[INK, SERIES[1]][k],
+                lw=1.6,
+                ls=["-", "--"][k],
+                label=f"Marchenko-Pastur, σ² = {sigma2:.2f} ({label})",
+            )
+        ax.set_xlim(0.0, top)
+        ax.set_xlabel("eigenvalue λ")
+        ax.set_ylabel("share of eigenvalues per bin")
+        ax.set_title(f"{n} stocks, {window.index[0].date()} to {window.index[-1].date()}")
+        ax.legend(loc="upper right")
+    finish(fig, out, "fig9_stock_spectrum")
 
 
 def fig_clipping_sim(table: Any, out: Path) -> None:
@@ -237,14 +302,17 @@ def fig_clipping_sim(table: Any, out: Path) -> None:
     grid = np.linspace(0.0, 0.985, 300)
     ax.plot(grid, [q0_theory(r) for r in grid], color=INK, lw=1.6, label="theory without cleaning")
     ax.plot(table["N/T"], table["q0_raw"], MARKERS[0], color=SERIES[0], mec=SURFACE, label="raw")
-    ax.plot(
-        table["N/T"],
-        table["q0_clipped"],
-        marker=MARKERS[1],
-        color=SERIES[1],
-        mec=SURFACE,
-        label="clipped",
-    )
+    for k, (column, label) in enumerate(
+        [("q0_clipped", "clipped"), ("q0_ledoit_wolf", "Ledoit-Wolf")], start=1
+    ):
+        ax.plot(
+            table["N/T"],
+            table[column],
+            marker=MARKERS[k],
+            color=SERIES[k],
+            mec=SURFACE,
+            label=label,
+        )
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(0.0, 8.0)
     ax.set_xlabel("assets per observation, N/T")
@@ -375,6 +443,8 @@ def main() -> int:
         industries = load("industries49", args.data_dir)
         size_bm = load("size_bm_100", args.data_dir)
         factors = load("factors", args.data_dir)
+        stocks, member = load_stocks(args.data_dir)
+        coverage = stock_coverage(args.data_dir)
     except FileNotFoundError as error:
         print(error, file=sys.stderr)
         return 1
@@ -385,6 +455,16 @@ def main() -> int:
         f"Last day {load(name, args.data_dir).index[-1].date()}."
         for name, (_, csv) in FILES.items()
     ]
+    vintages.append(
+        f"stocks: Zenodo {STOCKS_DOI}, {stocks.shape[1]} tickers, "
+        f"{stocks.index[0].date()} to {stocks.index[-1].date()}."
+    )
+    vintages += [
+        f"stocks/{name}: sha256 "
+        f"{hashlib.sha256((args.data_dir / 'stocks' / name).read_bytes()).hexdigest()}"
+        for name in STOCK_FILES
+    ]
+    n_boot = 200 if cfg.fast else 2000
     (out / "data_vintage.txt").write_text(
         "\n".join(vintages) + "\n", encoding="utf-8", newline="\n"
     )
@@ -407,14 +487,27 @@ def main() -> int:
 
     step("3/6 real spectra")
     spectra = ex.real_spectrum_table(universes)
+    stock_spectra = ex.stock_spectrum_table(stocks, member)
     fig_mp_real(universes, out)
+    fig_stock_spectrum(stocks, member, out)
     tables.append(("table4_real_spectra", "Spectra of French portfolio correlations", spectra))
 
     step("4/6 clipping")
     clip_sim = ex.clipping_sim_table(cfg)
-    clip_real = ex.clipping_real_table(universes)
+    clip_real = ex.min_variance_table(universes, n_boot=n_boot, seed=cfg.seed)
+    # the smoke run scores the last 48 rebalances only
+    first = len(stocks) - (1260 + 21 * 48) if cfg.fast else 0
+    stock_real = ex.min_variance_table(
+        {"sp500_stocks": stocks},
+        windows=(252, 504, 1260),
+        start=str(stocks.index[first].date()),
+        members={"sp500_stocks": member},
+        n_boot=n_boot,
+        seed=cfg.seed + 1,
+    )
     fig_clipping_sim(clip_sim, out)
-    fig_clipping_real(clip_real, out)
+    fig_min_variance(clip_real, out, "fig4_clipping_real")
+    fig_min_variance(stock_real, out, "fig10_stock_min_variance")
     tables += [
         ("table5_clipping_sim", "Clipping when the truth is one market mode", clip_sim),
         ("table6_clipping_real", "Minimum-variance portfolios on real returns", clip_real),
@@ -423,7 +516,7 @@ def main() -> int:
     step("5/6 absorption ratio")
     series = ex.absorption_series(industries)
     events = ex.absorption_events_table(series, market)
-    after = ex.absorption_returns_table(series, market)
+    after = ex.absorption_returns_table(series, market, n_boot=n_boot, seed=cfg.seed)
     monthly = series.dropna(subset=["absorption_ratio"]).resample("ME").last().reset_index()
     monthly["date"] = monthly["date"].dt.strftime("%Y-%m-%d")
     fig_absorption(series, out)
@@ -435,6 +528,7 @@ def main() -> int:
 
     step("6/6 feasibility under maximal loss and expected shortfall")
     ml = ex.ml_feasibility_table(cfg)
+    ml_recheck = ex.ml_recheck_table(cfg, ml)
     es = ex.es_feasibility_table(cfg)
     crossings = ex.es_half_crossings(es)
     boundary = ex.es_boundary_table()
@@ -445,6 +539,10 @@ def main() -> int:
         ("table10_es_feasibility", "Expected shortfall: share of samples with a solution", es),
         ("table11_es_crossings", "Expected shortfall: where the share crosses one half", crossings),
         ("table12_es_boundary", "Expected-shortfall phase boundary", boundary),
+        ("table13_stock_spectra", "Spectra of S&P 500 stock correlations", stock_spectra),
+        ("table14_stock_min_variance", "Minimum-variance portfolios of stocks", stock_real),
+        ("table15_stock_coverage", "Index members the stock panel holds, by year", coverage),
+        ("table16_ml_recheck", "Maximal loss: cells far from Eq. (26), re-run", ml_recheck),
     ]
 
     mode = "fast (smoke run, small simulations)" if cfg.fast else "full"

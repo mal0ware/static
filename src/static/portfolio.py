@@ -6,11 +6,12 @@ II", and Kondor, Pafka and Nagy (2007).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy import integrate, stats
 
 from static.cleaning import sample_covariance
 from static.mp import mp_bounds
@@ -52,6 +53,49 @@ def q1_theory(ratio: float) -> float:
     if not 0.0 <= ratio < 1.0:
         raise ValueError("N/T must be in [0, 1)")
     return float(np.sqrt(1.0 - ratio))
+
+
+def _f_law(n: int, t: int) -> tuple[float, int, int]:
+    if n < 2 or t < n:
+        raise ValueError("need N >= 2 and T >= N")
+    return (n - 1) / (t - n + 2), n - 1, t - n + 2
+
+
+def q0_exact_rms(n: int, t: int) -> float:
+    """Root mean square of ``q0`` at finite ``N`` and ``T``: ``sqrt((T - 1) / (T - N))``.
+
+    For Gaussian returns with a known zero mean the sample covariance is Wishart with
+    ``T`` degrees of freedom, and for any true covariance
+
+    ``q0^2 = 1 + (N - 1) / (T - N + 2) * F``, with ``F ~ F(N - 1, T - N + 2)``.
+
+    This is a property of the Wishart distribution and is not taken from the sources;
+    the tests check it against simulation. The mean of ``q0^2`` is finite for
+    ``T > N`` and its variance is finite only for ``T > N + 2``.
+    """
+    if t <= n:
+        raise ValueError("the mean of q0^2 is infinite unless T > N")
+    return float(np.sqrt((t - 1) / (t - n)))
+
+
+def q0_exact_quantile(n: int, t: int, prob: float = 0.5) -> float:
+    """Quantile of ``q0`` at finite ``N`` and ``T``. See :func:`q0_exact_rms`."""
+    scale, d1, d2 = _f_law(n, t)
+    return float(np.sqrt(1.0 + scale * stats.f(d1, d2).ppf(prob)))
+
+
+def q0_exact_mean(n: int, t: int) -> float:
+    """Mean of ``q0`` at finite ``N`` and ``T``, by quadrature. See :func:`q0_exact_rms`."""
+    scale, d1, d2 = _f_law(n, t)
+    law = stats.f(d1, d2)
+
+    def integrand(u: float) -> float:
+        # substitute F = u / (1 - u) so the heavy right tail maps to a finite interval
+        x = u / (1.0 - u)
+        return float(np.sqrt(1.0 + scale * x) * law.pdf(x) / (1.0 - u) ** 2)
+
+    value, _ = integrate.quad(integrand, 0.0, 1.0, limit=400)
+    return float(value)
 
 
 def q0_from_density(ratio: float, n_grid: int = 200001) -> float:
@@ -132,3 +176,26 @@ def simulate_noise_ratios(
         q1=float(np.sqrt(portfolio_variance(w, used) / base)),
         q2=float(np.sqrt(portfolio_variance(w, sigma2) / base)),
     )
+
+
+def paired_q0(
+    n: int,
+    t: int,
+    rng: np.random.Generator,
+    estimators: Mapping[str, Callable[[FloatArray], FloatArray]],
+    true_cov: FloatArray | None = None,
+) -> dict[str, float]:
+    """``q0`` of several covariance estimators on one and the same sample.
+
+    Each estimator maps the ``T x N`` return sample to a covariance matrix. Drawing the
+    sample once makes the difference between two estimators a paired comparison.
+    """
+    sigma0 = np.eye(n) if true_cov is None else np.asarray(true_cov, dtype=np.float64)
+    z = rng.standard_normal((t, n))
+    sample = z if true_cov is None else z @ np.linalg.cholesky(sigma0).T
+    base = portfolio_variance(min_variance_weights(sigma0), sigma0)
+    out = {}
+    for name, estimator in estimators.items():
+        w = min_variance_weights(estimator(sample))
+        out[name] = float(np.sqrt(portfolio_variance(w, sigma0) / base))
+    return out

@@ -71,6 +71,7 @@ def clip_correlation(
     fit: bool = False,
     n_keep: int | None = None,
     unit_diagonal: bool = True,
+    spectrum: tuple[FloatArray, FloatArray] | None = None,
 ) -> FloatArray:
     """Eigenvalue clipping. Potters, Bouchaud and Laloux (2005) Eq. (17).
 
@@ -81,8 +82,11 @@ def clip_correlation(
 
     The clipped matrix no longer has an exactly unit diagonal. With
     ``unit_diagonal=True`` it is rescaled to one; that step is not in the source.
+
+    ``spectrum`` may hold the output of :func:`sorted_eigh` for ``corr`` when the
+    caller already has it.
     """
-    values, vectors = sorted_eigh(corr)
+    values, vectors = sorted_eigh(corr) if spectrum is None else spectrum
     n = values.size
     k = count_signal(values, q, fit=fit) if n_keep is None else n_keep
     if not 0 <= k <= n:
@@ -97,8 +101,17 @@ def clip_correlation(
     return np.asarray(out, dtype=np.float64)
 
 
-def clip_covariance(cov: FloatArray, q: float, *, fit: bool = False) -> FloatArray:
-    """Clip the correlation matrix inside a covariance matrix, keeping sample variances."""
+def clip_covariance(
+    cov: FloatArray,
+    q: float,
+    *,
+    fit: bool = False,
+    spectrum: tuple[FloatArray, FloatArray] | None = None,
+) -> FloatArray:
+    """Clip the correlation matrix inside a covariance matrix, keeping sample variances.
+
+    ``spectrum`` is passed on to :func:`clip_correlation`.
+    """
     vol = np.sqrt(np.diag(cov))
-    cleaned = clip_correlation(correlation_from_covariance(cov), q, fit=fit)
+    cleaned = clip_correlation(correlation_from_covariance(cov), q, fit=fit, spectrum=spectrum)
     return np.asarray(cleaned * np.outer(vol, vol), dtype=np.float64)

@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from scipy import stats
 
-from static.cleaning import clip_covariance
+from static.cleaning import clip_covariance, sample_covariance
 from static.portfolio import (
     market_mode_covariance,
     min_variance_weights,
+    paired_q0,
     portfolio_variance,
+    q0_exact_mean,
+    q0_exact_quantile,
+    q0_exact_rms,
     q0_from_density,
     q0_theory,
     q1_theory,
@@ -133,3 +138,57 @@ def test_clipping_removes_the_divergence_when_the_truth_is_one_factor() -> None:
     )
     assert raw > 2.0
     assert cleaned < 1.25
+
+
+@pytest.mark.parametrize(("n", "t"), [(10, 13), (20, 22), (5, 40)])
+def test_exact_law_of_q0_against_simulation(n: int, t: int) -> None:
+    """q0^2 = 1 + (N - 1) / (T - N + 2) * F(N - 1, T - N + 2)."""
+    rng = np.random.default_rng(n * 1000 + t)
+    q0 = np.array([simulate_noise_ratios(n, t, rng).q0 for _ in range(4000)])
+    scaled = (q0**2 - 1.0) * (t - n + 2) / (n - 1)
+    assert stats.kstest(scaled, stats.f(n - 1, t - n + 2).cdf).pvalue > 0.001
+    assert np.median(q0) == pytest.approx(q0_exact_quantile(n, t), rel=0.03)
+
+
+def test_exact_law_holds_for_a_market_mode_too() -> None:
+    rng = np.random.default_rng(8)
+    n, t = 12, 16
+    cov = market_mode_covariance(n)
+    q0 = np.array([simulate_noise_ratios(n, t, rng, true_cov=cov).q0 for _ in range(4000)])
+    scaled = (q0**2 - 1.0) * (t - n + 2) / (n - 1)
+    assert stats.kstest(scaled, stats.f(n - 1, t - n + 2).cdf).pvalue > 0.001
+
+
+def test_exact_moments_are_ordered_and_reach_the_limit() -> None:
+    assert q0_exact_rms(100, 102) == pytest.approx(np.sqrt(101 / 2))
+    for n, t in [(100, 102), (400, 408), (50, 100)]:
+        assert q0_exact_quantile(n, t) < q0_exact_mean(n, t) < q0_exact_rms(n, t)
+    # the mean climbs towards 1 / sqrt(1 - N/T) as N grows at fixed N/T
+    means = [q0_exact_mean(n, round(n / 0.98)) for n in (100, 200, 400, 3200)]
+    assert means == sorted(means)
+    assert means[-1] == pytest.approx(q0_theory(0.98), rel=0.01)
+    assert q0_exact_mean(200, 2000) == pytest.approx(q0_theory(0.1), rel=0.002)
+    with pytest.raises(ValueError, match="infinite"):
+        q0_exact_rms(10, 10)
+    with pytest.raises(ValueError, match="N >= 2"):
+        q0_exact_quantile(10, 9)
+
+
+def test_exact_mean_against_simulation() -> None:
+    rng = np.random.default_rng(9)
+    q0 = np.array([simulate_noise_ratios(30, 34, rng).q0 for _ in range(4000)])
+    se = q0.std(ddof=1) / np.sqrt(q0.size)
+    assert abs(q0.mean() - q0_exact_mean(30, 34)) < 4 * se
+
+
+def test_paired_q0_scores_every_estimator_on_one_sample() -> None:
+    estimators = {
+        "raw": lambda x: sample_covariance(x, demean=False),
+        "again": lambda x: sample_covariance(x, demean=False),
+        "identity": lambda x: np.eye(x.shape[1]),
+    }
+    out = paired_q0(15, 40, np.random.default_rng(10), estimators)
+    assert out["raw"] == out["again"] > 1.0
+    assert out["identity"] == pytest.approx(1.0)
+    same_stream = simulate_noise_ratios(15, 40, np.random.default_rng(10)).q0
+    assert out["raw"] == pytest.approx(same_stream)

@@ -17,6 +17,8 @@ from numpy.typing import NDArray
 from static.absorption import default_components, rolling_absorption_ratio, standardized_shift
 from static.cleaning import (
     clip_covariance,
+    correlation_from_covariance,
+    count_signal,
     sample_correlation,
     sample_covariance,
     sorted_eigh,
@@ -32,11 +34,16 @@ from static.mp import fit_noise_variance, ks_distance, mp_bounds
 from static.portfolio import (
     market_mode_covariance,
     min_variance_weights,
+    paired_q0,
     portfolio_variance,
+    q0_exact_mean,
+    q0_exact_quantile,
+    q0_exact_rms,
     q0_theory,
     q1_theory,
     simulate_noise_ratios,
 )
+from static.shrinkage import ledoit_wolf
 
 FloatArray = NDArray[np.float64]
 Frame = Any  # pandas is treated as untyped
@@ -69,13 +76,29 @@ class Config:
 # --------------------------------------------------------------------------------------
 
 
+def _median_interval(
+    values: FloatArray, rng: np.random.Generator, n_boot: int = 2000
+) -> tuple[float, float]:
+    """95% percentile-bootstrap interval for the median of ``values``."""
+    picks = rng.integers(0, values.size, size=(n_boot, values.size))
+    medians = np.median(values[picks], axis=1)
+    lo, hi = np.quantile(medians, [0.025, 0.975])
+    return float(lo), float(hi)
+
+
 def divergence_table(cfg: Config) -> Frame:
-    """Mean ``q0``, ``q1`` and ``q2`` against ``N/T`` for unit covariance."""
+    """``q0``, ``q1`` and ``q2`` against ``N/T`` for unit covariance.
+
+    ``q0_theory`` is the large-size limit ``1 / sqrt(1 - N/T)``. The ``exact`` columns
+    are the finite-size law of :func:`static.portfolio.q0_exact_rms`. Near ``N = T``
+    the distribution of ``q0`` has a heavy right tail, so the median is reported with
+    a bootstrap interval next to the mean and the root mean square.
+    """
     if cfg.fast:
         sizes = {50: 20, 100: 20}
         ratios = [0.2, 0.5, 0.8, 0.9, 0.95]
     else:
-        sizes = {100: 200, 200: 100, 400: 50}
+        sizes = {100: 2000, 200: 1000, 400: 500}
         ratios = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98]
     rows = []
     for n, reps in sizes.items():
@@ -86,6 +109,8 @@ def divergence_table(cfg: Config) -> Frame:
             q0 = np.array([d.q0 for d in draws])
             q1 = np.array([d.q1 for d in draws])
             q2 = np.array([d.q2 for d in draws])
+            lo, hi = _median_interval(q0, cfg.rng(1, n, j, 1))
+            se = q0.std(ddof=1) / np.sqrt(reps)
             rows.append(
                 {
                     "N": n,
@@ -93,9 +118,18 @@ def divergence_table(cfg: Config) -> Frame:
                     "N/T": n / t,
                     "samples": reps,
                     "q0_mean": q0.mean(),
+                    "q0_se": se,
                     "q0_sd": q0.std(ddof=1),
                     "q0_theory": q0_theory(n / t),
                     "q0_mean/theory": q0.mean() / q0_theory(n / t),
+                    "q0_mean_exact": q0_exact_mean(n, t),
+                    "z_mean_vs_exact": (q0.mean() - q0_exact_mean(n, t)) / se,
+                    "q0_median": float(np.median(q0)),
+                    "q0_median_lo": lo,
+                    "q0_median_hi": hi,
+                    "q0_median_exact": q0_exact_quantile(n, t),
+                    "q0_rms": float(np.sqrt(np.mean(q0**2))),
+                    "q0_rms_exact": q0_exact_rms(n, t),
                     "q1_mean": q1.mean(),
                     "q1_theory": q1_theory(n / t),
                     "q2_mean": q2.mean(),
@@ -204,6 +238,23 @@ def mp_edge_table(cfg: Config) -> Frame:
 # --------------------------------------------------------------------------------------
 
 
+def widest_band_share(values: FloatArray, q: float) -> tuple[float, float]:
+    """The largest share of eigenvalues any Marchenko-Pastur band can hold.
+
+    Scans ``sigma2`` from 0.02 to 2 in steps of 0.005 and returns the best share with
+    its ``sigma2``. It is an upper bound on how much of a spectrum can be called noise
+    by this test: the band is placed wherever it catches most eigenvalues, with no
+    regard for whether the density inside it fits.
+    """
+    best_share, best_sigma2 = 0.0, float("nan")
+    for sigma2 in np.arange(0.02, 2.0001, 0.005):
+        lo, hi = mp_bounds(q, float(sigma2))
+        share = float(np.mean((values >= lo) & (values <= hi)))
+        if share > best_share:
+            best_share, best_sigma2 = share, float(sigma2)
+    return best_share, best_sigma2
+
+
 def spectrum_summary(returns: FloatArray) -> dict[str, float]:
     """Laloux-style summary of one ``T x N`` return window."""
     t, n = returns.shape
@@ -212,6 +263,10 @@ def spectrum_summary(returns: FloatArray) -> dict[str, float]:
     _, plain_hi = mp_bounds(q)
     fit = fit_noise_variance(values, q)
     noise = values[fit.n_signal :]
+    # Laloux et al.'s first step: remove the market mode only, sigma2 = 1 - lambda_1 / N
+    step_sigma2 = 1.0 - values[0] / n
+    step_lo, step_hi = mp_bounds(q, step_sigma2)
+    widest_share, widest_sigma2 = widest_band_share(values, q)
     return {
         "N": n,
         "T": t,
@@ -221,6 +276,13 @@ def spectrum_summary(returns: FloatArray) -> dict[str, float]:
         "lambda_1/lambda_max": values[0] / plain_hi,
         "lambda_1_share_of_variance": values[0] / n,
         "n_above_plain_edge": int(np.sum(values > plain_hi)),
+        "sigma2_first_step": step_sigma2,
+        "n_above_first_step_edge": int(np.sum(values > step_hi)),
+        "share_of_eigenvalues_in_first_step_band": float(
+            np.mean((values >= step_lo) & (values <= step_hi))
+        ),
+        "share_of_eigenvalues_below_first_step_band": float(np.mean(values < step_lo)),
+        "variance_share_above_first_step_edge": float(values[values > step_hi].sum() / n),
         "sigma2_fitted": fit.sigma2,
         "n_above_fitted_edge": fit.n_signal,
         "share_of_eigenvalues_in_fitted_band": float(
@@ -229,6 +291,8 @@ def spectrum_summary(returns: FloatArray) -> dict[str, float]:
         "share_of_eigenvalues_below_fitted_band": float(np.mean(values < fit.lambda_min)),
         "variance_share_above_fitted_edge": float(values[: fit.n_signal].sum() / n),
         "ks_distance_of_bulk": ks_distance(noise, q, fit.sigma2),
+        "largest_share_in_any_band": widest_share,
+        "sigma2_of_that_band": widest_sigma2,
     }
 
 
@@ -251,92 +315,199 @@ def real_spectrum_table(universes: dict[str, Frame]) -> Frame:
     return pd.DataFrame(rows)
 
 
+def stock_windows(returns: Frame, member: Frame, length: int = 1309) -> list[tuple[Frame, int]]:
+    """Back-to-back windows of ``length`` days, counted back from the last day.
+
+    Each window keeps the stocks that were index members on its last day and have a
+    return on every day in it. The second item is the number of members on that day
+    that the panel holds at all.
+    """
+    out = []
+    end = len(returns)
+    while end - length >= 0:
+        window = returns.iloc[end - length : end]
+        held = member.iloc[end - 1].to_numpy()
+        complete = window.notna().all(axis=0).to_numpy()
+        out.append((window.loc[:, held & complete], int(held.sum())))
+        end -= length
+    return out[::-1]
+
+
+def stock_spectrum_table(returns: Frame, member: Frame, length: int = 1309) -> Frame:
+    """Laloux et al.'s measurement on individual stocks, window by window.
+
+    Their sample was 406 stocks over 1309 days, so the window is 1309 days.
+    """
+    rows = []
+    for window, held in stock_windows(returns, member, length):
+        row: dict[str, Any] = {
+            "universe": "sp500_stocks",
+            "start": str(window.index[0].date()),
+            "end": str(window.index[-1].date()),
+            "members_in_panel": held,
+        }
+        row.update(spectrum_summary(window.to_numpy(dtype=np.float64)))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 # --------------------------------------------------------------------------------------
 # 4. Clipping and out-of-sample risk
 # --------------------------------------------------------------------------------------
 
 
-def _clip_plain(cov: FloatArray, q: float) -> FloatArray:
-    return clip_covariance(cov, q)
+def _raw(sample: FloatArray) -> FloatArray:
+    return sample_covariance(sample, demean=False)
+
+
+def _clipped(sample: FloatArray) -> FloatArray:
+    return clip_covariance(_raw(sample), sample.shape[0] / sample.shape[1])
+
+
+def _shrunk(sample: FloatArray) -> FloatArray:
+    return ledoit_wolf(sample, demean=False).covariance
+
+
+SIM_ESTIMATORS = {"raw": _raw, "clipped": _clipped, "ledoit_wolf": _shrunk}
 
 
 def clipping_sim_table(cfg: Config) -> Frame:
-    """``q0`` with and without clipping when the truth is one market mode plus noise."""
+    """``q0`` of three estimators when the truth is one market mode plus noise.
+
+    All three are scored on the same samples, so the differences are paired and their
+    standard errors are those of the per-sample difference.
+    """
     n = 50 if cfg.fast else 100
-    reps = 10 if cfg.fast else 100
+    reps = 10 if cfg.fast else 200
     ratios = [0.2, 0.5, 0.8, 0.95] if cfg.fast else [0.1, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 0.98]
     cov = market_mode_covariance(n)
     rows = []
     for j, ratio in enumerate(ratios):
         t = round(n / ratio)
         rng = cfg.rng(4, j)
-        raw = np.array([simulate_noise_ratios(n, t, rng, true_cov=cov).q0 for _ in range(reps)])
-        clipped = np.array(
-            [
-                simulate_noise_ratios(n, t, rng, true_cov=cov, cleaner=_clip_plain).q0
-                for _ in range(reps)
-            ]
-        )
-        rows.append(
-            {
-                "N": n,
-                "T": t,
-                "N/T": n / t,
-                "samples": reps,
-                "q0_raw": raw.mean(),
-                "q0_raw_sd": raw.std(ddof=1),
-                "q0_clipped": clipped.mean(),
-                "q0_clipped_sd": clipped.std(ddof=1),
-                "q0_theory_raw": q0_theory(n / t),
-            }
-        )
+        draws = [paired_q0(n, t, rng, SIM_ESTIMATORS, true_cov=cov) for _ in range(reps)]
+        q = {name: np.array([d[name] for d in draws]) for name in SIM_ESTIMATORS}
+        row: dict[str, Any] = {"N": n, "T": t, "N/T": n / t, "samples": reps}
+        for name, values in q.items():
+            row[f"q0_{name}"] = values.mean()
+            row[f"q0_{name}_sd"] = values.std(ddof=1)
+        for first, second in (("clipped", "raw"), ("ledoit_wolf", "clipped")):
+            diff = q[first] - q[second]
+            row[f"{first}_minus_{second}"] = diff.mean()
+            row[f"{first}_minus_{second}_se"] = diff.std(ddof=1) / np.sqrt(reps)
+        row["q0_theory_raw"] = q0_theory(n / t)
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
-CLIP_METHODS = ("equal weight", "raw", "clipped", "clipped, fitted edge")
+CLIP_METHODS = ("equal weight", "raw", "clipped", "clipped, fitted edge", "ledoit-wolf")
+REFERENCE_METHOD = "ledoit-wolf"
 
 
-def clipping_real_table(
+def _period_variance(stats: FloatArray) -> float:
+    """Variance of daily returns from per-period (days, sum, sum of squares) rows."""
+    days, total, squares = stats.sum(axis=0)
+    return float(squares / days - (total / days) ** 2)
+
+
+def _ratio_interval(
+    stats_a: FloatArray, stats_b: FloatArray, rng: np.random.Generator, block: int, n_boot: int
+) -> tuple[float, float]:
+    """Block-bootstrap interval for the ratio of two realised volatilities.
+
+    ``stats_a`` and ``stats_b`` hold, for each holding period, the number of days, the
+    sum of returns and the sum of squared returns. Holding periods are resampled in
+    runs of ``block`` consecutive periods, wrapping at the end, and the same periods
+    are drawn for both portfolios.
+    """
+    periods = stats_a.shape[0]
+    n_blocks = int(np.ceil(periods / block))
+    starts = rng.integers(0, periods, size=(n_boot, n_blocks))
+    picks = (starts[:, :, None] + np.arange(block)[None, None, :]) % periods
+    picks = picks.reshape(n_boot, -1)[:, :periods]
+
+    def variance(stats: FloatArray) -> FloatArray:
+        total = stats[picks].sum(axis=1)
+        return np.asarray(total[:, 2] / total[:, 0] - (total[:, 1] / total[:, 0]) ** 2)
+
+    ratios = np.sqrt(variance(stats_a) / variance(stats_b))
+    lo, hi = np.quantile(ratios, [0.025, 0.975])
+    return float(lo), float(hi)
+
+
+def min_variance_table(
     universes: dict[str, Frame],
     windows: tuple[int, ...] = (63, 126, 252, 504, 1260),
     hold: int = 21,
     start: str = "1969-07-01",
+    members: dict[str, Frame] | None = None,
+    block: int = 6,
+    n_boot: int = 2000,
+    seed: int = 20261123,
 ) -> Frame:
     """Minimum-variance portfolios on real returns, estimated on trailing windows.
 
-    Every ``hold`` days the covariance of the last ``T`` days is estimated, cleaned or
-    not, and the fully invested minimum-variance portfolio is held for the next ``hold``
-    days at fixed weights. All window lengths are scored on the same days, which begin
-    once the longest window is available.
+    Every ``hold`` days the covariance of the last ``T`` days is estimated by each
+    method, and the fully invested minimum-variance portfolio is held for the next
+    ``hold`` days at fixed weights. All window lengths are scored on the same days,
+    which begin once the longest window is available.
 
-    With fewer days than assets the raw matrix cannot be inverted and the fitted edge is
-    not defined, so those two rows are empty. One missing value in the industry file is
-    set to zero; size and book-to-market portfolios with gaps are left out.
+    The assets used at a rebalance are chosen from what was known that day: those with
+    a return on every one of the last ``max(windows)`` days and, when ``members`` has
+    an entry for the universe, those flagged as members on the last of those days. The
+    same assets are used for every window length. A return that is missing during the
+    holding period is taken as zero.
+
+    With fewer days than assets the raw matrix cannot be inverted and the fitted edge
+    is not defined, so those two methods are skipped at that rebalance.
+
+    ``vol_ratio_to_ledoit_wolf`` is realised volatility over that of the Ledoit-Wolf
+    portfolio on the same holding periods, with a 95% block-bootstrap interval
+    (``block`` consecutive holding periods a block).
     """
     rows = []
     longest = max(windows)
-    for name, frame in universes.items():
+    for u, (name, frame) in enumerate(universes.items()):
         window_frame = frame.loc[start:]
-        window_frame = window_frame.loc[
-            :, window_frame.notna().sum(axis=0) >= len(window_frame) - 5
-        ]
-        x = window_frame.fillna(0.0).to_numpy(dtype=np.float64)
-        total, n = x.shape
-        rebalance = range(longest, total - hold + 1, hold)
-        for t in windows:
-            realised: dict[str, list[FloatArray]] = {m: [] for m in CLIP_METHODS}
+        x = window_frame.to_numpy(dtype=np.float64)
+        gaps = np.concatenate([np.zeros((1, x.shape[1])), np.cumsum(np.isnan(x), axis=0)])
+        flags = None
+        if members is not None and name in members:
+            flags = members[name].reindex_like(window_frame).to_numpy(dtype=bool)
+        total = x.shape[0]
+        rebalance = list(range(longest, total - hold + 1, hold))
+        eligible = []
+        for now in rebalance:
+            keep = (gaps[now] - gaps[now - longest]) == 0
+            if flags is not None:
+                keep &= flags[now - 1]
+            eligible.append(np.flatnonzero(keep))
+        sizes = np.array([len(e) for e in eligible])
+        for k, t in enumerate(windows):
+            stats: dict[str, dict[int, FloatArray]] = {m: {} for m in CLIP_METHODS}
             predicted: dict[str, list[float]] = {m: [] for m in CLIP_METHODS}
             gross: dict[str, list[float]] = {m: [] for m in CLIP_METHODS}
-            for now in rebalance:
-                past, future = x[now - t : now], x[now : now + hold]
+            kept: dict[str, list[float]] = {m: [] for m in CLIP_METHODS}
+            intensity: list[float] = []
+            for i, now in enumerate(rebalance):
+                cols = eligible[i]
+                n = len(cols)
+                if n < 2:
+                    continue
+                past = x[now - t : now][:, cols]
+                future = np.nan_to_num(x[now : now + hold][:, cols], nan=0.0)
                 cov = sample_covariance(past)
+                shrunk = ledoit_wolf(past)
+                intensity.append(shrunk.intensity)
+                spectrum = sorted_eigh(correlation_from_covariance(cov))
                 estimates: dict[str, FloatArray | None] = {
                     "equal weight": None,
                     "raw": cov if t > n else None,
-                    "clipped": clip_covariance(cov, t / n),
-                    "clipped, fitted edge": clip_covariance(cov, t / n, fit=True)
+                    "clipped": clip_covariance(cov, t / n, spectrum=spectrum),
+                    "clipped, fitted edge": clip_covariance(cov, t / n, fit=True, spectrum=spectrum)
                     if t > n
                     else None,
+                    "ledoit-wolf": shrunk.covariance,
                 }
                 for method in CLIP_METHODS:
                     estimate = estimates[method]
@@ -348,34 +519,55 @@ def clipping_real_table(
                     else:
                         w = min_variance_weights(estimate)
                         predicted[method].append(portfolio_variance(w, estimate))
-                    realised[method].append(future @ w)
+                    if method.startswith("clipped"):
+                        fitted = method.endswith("fitted edge")
+                        kept[method].append(count_signal(spectrum[0], t / n, fit=fitted))
+                    held = future @ w
+                    stats[method][i] = np.array([held.size, held.sum(), np.sum(held**2)])
                     gross[method].append(float(np.abs(w).sum()))
             for method in CLIP_METHODS:
                 base = {
                     "universe": name,
-                    "N": n,
                     "T": t,
-                    "N/T": n / t,
                     "method": method,
+                    "N_mean": float(sizes.mean()),
+                    "N_min": int(sizes.min()),
+                    "N_max": int(sizes.max()),
+                    "N/T": float(sizes.mean()) / t,
                     "first_day": str(window_frame.index[longest].date()),
                     "last_day": str(window_frame.index[rebalance[-1] + hold - 1].date()),
+                    "rebalances_possible": len(rebalance),
                 }
-                if not realised[method]:
+                if not stats[method]:
                     rows.append(base | {"rebalances": 0})
                     continue
-                returns = np.concatenate(realised[method])
-                realised_var = float(np.mean(returns**2) - np.mean(returns) ** 2)
+                realised_var = _period_variance(np.array(list(stats[method].values())))
                 predicted_var = float(np.mean(predicted[method]))
-                rows.append(
-                    base
-                    | {
-                        "rebalances": len(realised[method]),
-                        "realised_vol_pct": 100.0 * np.sqrt(TRADING_DAYS * realised_var),
-                        "predicted_vol_pct": 100.0 * np.sqrt(TRADING_DAYS * predicted_var),
-                        "realised/predicted": np.sqrt(realised_var / predicted_var),
-                        "gross_leverage": float(np.mean(gross[method])),
+                row = base | {
+                    "rebalances": len(stats[method]),
+                    "realised_vol_pct": 100.0 * np.sqrt(TRADING_DAYS * realised_var),
+                    "predicted_vol_pct": 100.0 * np.sqrt(TRADING_DAYS * predicted_var),
+                    "realised/predicted": np.sqrt(realised_var / predicted_var),
+                    "gross_leverage": float(np.mean(gross[method])),
+                }
+                if method != REFERENCE_METHOD:
+                    common = sorted(set(stats[method]) & set(stats[REFERENCE_METHOD]))
+                    own = np.array([stats[method][i] for i in common])
+                    ref = np.array([stats[REFERENCE_METHOD][i] for i in common])
+                    rng = np.random.default_rng([seed, 8, u, k])
+                    lo, hi = _ratio_interval(own, ref, rng, block, n_boot)
+                    row |= {
+                        "vol_ratio_to_ledoit_wolf": np.sqrt(
+                            _period_variance(own) / _period_variance(ref)
+                        ),
+                        "ratio_lo": lo,
+                        "ratio_hi": hi,
                     }
-                )
+                if kept[method]:
+                    row["eigenvalues_kept_mean"] = float(np.mean(kept[method]))
+                if method == REFERENCE_METHOD:
+                    row["shrinkage_mean"] = float(np.mean(intensity))
+                rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -446,11 +638,52 @@ KRITZMAN_EXHIBIT9: dict[int, tuple[float, float]] = {
 }
 
 
-def absorption_returns_table(series: Frame, market: Frame) -> Frame:
+def _runs(flags: NDArray[np.bool_]) -> int:
+    """Number of unbroken runs of True."""
+    if flags.size == 0:
+        return 0
+    return int(flags[0]) + int(np.sum(flags[1:] & ~flags[:-1]))
+
+
+def _difference_interval(
+    forward: FloatArray,
+    up: NDArray[np.bool_],
+    down: NDArray[np.bool_],
+    rng: np.random.Generator,
+    block: int,
+    n_boot: int,
+) -> tuple[float, float, float]:
+    """Moving-block bootstrap of mean return after increases minus after decreases.
+
+    Days are resampled in runs of ``block`` consecutive days, wrapping at the end, so
+    overlapping forward returns and clustered signal days stay together. Returns the
+    2.5% and 97.5% points and the share of resamples with a positive difference.
+    """
+    days = forward.size
+    n_blocks = int(np.ceil(days / block))
+    out = []
+    for _ in range(n_boot):
+        starts = rng.integers(0, days, size=n_blocks)
+        picks = ((starts[:, None] + np.arange(block)[None, :]) % days).ravel()[:days]
+        f, u, d = forward[picks], up[picks], down[picks]
+        if u.any() and d.any():
+            out.append(f[u].mean() - f[d].mean())
+    values = np.array(out)
+    lo, hi = np.quantile(values, [0.025, 0.975])
+    return float(lo), float(hi), float(np.mean(values > 0.0))
+
+
+def absorption_returns_table(
+    series: Frame, market: Frame, block: int = 126, n_boot: int = 2000, seed: int = 20261123
+) -> Frame:
     """Market return after one-sigma shifts in the absorption ratio (Exhibit 9 analogue).
 
     The signal is known at the close of day ``t``; the return runs over days ``t + 1`` to
     ``t + h`` and is annualised as ``mean * 252 / h``.
+
+    Forward returns overlap by ``h - 1`` days and signal days come in runs, so a
+    t-statistic that treats days as independent is far too large. The interval for the
+    difference is a moving-block bootstrap over days with blocks of ``block`` days.
     """
     shift = series["standardized_shift"]
     market = market.reindex(shift.index)
@@ -461,30 +694,35 @@ def absorption_returns_table(series: Frame, market: Frame) -> Frame:
         ("all days", str(shift.dropna().index[0].date()), str(shift.index[-1].date())),
     ]
     rows = []
-    for label, start, end in periods:
+    for p, (label, start, end) in enumerate(periods):
         for horizon, (paper_up, paper_down) in KRITZMAN_EXHIBIT9.items():
             forward = np.expm1(log_wealth.shift(-horizon) - log_wealth).loc[start:end]
             signal = shift.loc[start:end]
-            ok = forward.notna() & signal.notna()
-            up, down = forward[ok & (signal > 1.0)], forward[ok & (signal < -1.0)]
+            ok = (forward.notna() & signal.notna()).to_numpy()
+            f = forward.to_numpy(dtype=np.float64)[ok]
+            sig = signal.to_numpy(dtype=np.float64)[ok]
+            up, down = sig > 1.0, sig < -1.0
             scale = 100.0 * TRADING_DAYS / horizon
-            everything = forward[ok]
-            diff = up.mean() - down.mean()
-            # days overlap by h - 1 and signals cluster, so this standard error is too small
-            se = np.sqrt(up.var(ddof=1) / len(up) + down.var(ddof=1) / len(down))
+            diff = f[up].mean() - f[down].mean()
+            rng = np.random.default_rng([seed, 9, p, horizon])
+            lo, hi, positive = _difference_interval(f, up, down, rng, block, n_boot)
             rows.append(
                 {
                     "period": label,
                     "start": start,
                     "end": end,
                     "horizon_days": horizon,
-                    "days_shift_above_1": len(up),
-                    "days_shift_below_-1": len(down),
-                    "after_increase_pct": scale * up.mean(),
-                    "after_decrease_pct": scale * down.mean(),
+                    "days_shift_above_1": int(up.sum()),
+                    "runs_shift_above_1": _runs(up),
+                    "days_shift_below_-1": int(down.sum()),
+                    "runs_shift_below_-1": _runs(down),
+                    "after_increase_pct": scale * f[up].mean(),
+                    "after_decrease_pct": scale * f[down].mean(),
                     "difference_pct": scale * diff,
-                    "naive_t_of_difference": diff / se,
-                    "all_days_pct": scale * everything.mean(),
+                    "difference_lo_pct": scale * lo,
+                    "difference_hi_pct": scale * hi,
+                    "share_of_resamples_positive": positive,
+                    "all_days_pct": scale * f.mean(),
                     "paper_after_increase_pct": paper_up if label == "paper sample" else np.nan,
                     "paper_after_decrease_pct": paper_down if label == "paper sample" else np.nan,
                 }
@@ -524,6 +762,41 @@ def ml_feasibility_table(cfg: Config) -> Frame:
                     / max(np.sqrt(exact * (1.0 - exact) / reps), 1e-12),
                 }
             )
+    return pd.DataFrame(rows)
+
+
+def ml_recheck_table(cfg: Config, table: Frame, threshold: float = 3.0) -> Frame:
+    """Re-run the maximal-loss cells that sit far from Eq. (26), with fresh draws.
+
+    Every cell of ``table`` with ``|z| >= threshold`` is simulated again with ten times
+    the samples and a different random stream. When no cell qualifies, the one with the
+    largest ``|z|`` is re-run, so the table is never empty. A cell that was only a
+    chance outlier should come back close to the formula.
+    """
+    far = table[table["z_score"].abs() >= threshold]
+    if far.empty:
+        far = table.loc[[table["z_score"].abs().idxmax()]]
+    rows = []
+    for _, cell in far.iterrows():
+        n, t, first_reps = int(cell["N"]), int(cell["T"]), int(cell["samples"])
+        reps = 10 * first_reps
+        rng = cfg.rng(10, n, t)
+        hits = sum(minimise_maximal_loss(rng.standard_normal((t, n))).bounded for _ in range(reps))
+        exact = ml_feasible_probability(n, t)
+        rows.append(
+            {
+                "N": n,
+                "T": t,
+                "first_samples": first_reps,
+                "first_simulated": float(cell["simulated"]),
+                "first_z_score": float(cell["z_score"]),
+                "samples": reps,
+                "simulated": hits / reps,
+                "eq26_exact": exact,
+                "z_score": (hits / reps - exact)
+                / max(np.sqrt(exact * (1.0 - exact) / reps), 1e-12),
+            }
+        )
     return pd.DataFrame(rows)
 
 

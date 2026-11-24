@@ -64,3 +64,51 @@ def complete_window(frame: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
     """Rows from ``start`` to ``end``, keeping only columns with no missing value there."""
     window = frame.loc[start:end]
     return window.loc[:, window.notna().all(axis=0)]
+
+
+# --------------------------------------------------------------------------------------
+# Individual stocks: G. Lim's point-in-time S&P 500 panel on Zenodo
+# --------------------------------------------------------------------------------------
+
+STOCKS_DOI = "10.5281/zenodo.23933497"
+STOCKS_URL = (
+    "https://zenodo.org/api/records/23933497/files/SP500_KRX_Conservative_Transport_v1.zip/content"
+)
+STOCKS_PREFIX = "SP500_KRX_Conservative_Transport_v1/"
+
+#: file kept in ``data/stocks`` -> path inside the archive
+STOCK_FILES: dict[str, str] = {
+    "logret.parquet": "Processed/Panel_US/logret.parquet",
+    "membership_daily.parquet": "DATA/US/membership_daily.parquet",
+    "coverage_by_year.csv": "DATA/US/coverage_by_year.csv",
+    "collection_log.csv": "DATA/US/collection_log.csv",
+}
+
+
+def load_stocks(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Daily simple returns and index membership for the recovered S&P 500 stocks.
+
+    Returns ``(returns, member)`` with the same dates and tickers. ``returns`` is the
+    deposit's log return turned back into a simple return, NaN where the stock has no
+    price. ``member`` is True on days the stock was in the index. The first day of the
+    panel has no previous price and is dropped.
+    """
+    folder = data_dir / "stocks"
+    paths = [folder / "logret.parquet", folder / "membership_daily.parquet"]
+    for path in paths:
+        if not path.exists():
+            raise FileNotFoundError(f"{path} is missing; run scripts/fetch_data.py first")
+    log_returns = pd.read_parquet(paths[0]).astype(np.float64)
+    member = pd.read_parquet(paths[1]).astype(bool)
+    if not (log_returns.columns.equals(member.columns) and log_returns.index.equals(member.index)):
+        raise ValueError("the return and membership panels do not line up")
+    log_returns.index.name = member.index.name = "date"
+    return np.expm1(log_returns).iloc[1:], member.iloc[1:]
+
+
+def stock_coverage(data_dir: Path) -> pd.DataFrame:
+    """The deposit's own table of how many index members it recovered, by year."""
+    path = data_dir / "stocks" / "coverage_by_year.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} is missing; run scripts/fetch_data.py first")
+    return pd.read_csv(path)

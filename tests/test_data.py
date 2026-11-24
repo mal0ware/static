@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import pytest
 
-from static.data import complete_window, parse_french_csv, vintage
+from static.data import (
+    complete_window,
+    load_stocks,
+    parse_french_csv,
+    stock_coverage,
+    vintage,
+)
 
 SAMPLE = """This file was created using the 202609 CRSP database.
 It contains value- and equal-weighted returns for 3 portfolios.
@@ -68,3 +77,31 @@ def test_complete_window_drops_columns_with_gaps() -> None:
         "Food",
         "Soda",
     ]
+
+
+def test_load_stocks_turns_log_returns_into_simple_returns(tmp_path: Path) -> None:
+    folder = tmp_path / "stocks"
+    folder.mkdir()
+    index = pd.to_datetime(["2000-01-03", "2000-01-04", "2000-01-05"])
+    log_returns = pd.DataFrame(
+        {"AAA": [0.0, np.log(1.1), np.log(0.5)], "BBB": [np.nan, np.nan, 0.0]}, index=index
+    )
+    member = pd.DataFrame({"AAA": [True, True, False], "BBB": [False, False, True]}, index=index)
+    log_returns.to_parquet(folder / "logret.parquet")
+    member.to_parquet(folder / "membership_daily.parquet")
+    returns, flags = load_stocks(tmp_path)
+    assert list(returns.index.strftime("%Y-%m-%d")) == ["2000-01-04", "2000-01-05"]
+    assert returns["AAA"].tolist() == pytest.approx([0.1, -0.5])
+    assert np.isnan(returns["BBB"].iloc[0])
+    assert flags["BBB"].tolist() == [False, True]
+
+    member.iloc[:, ::-1].to_parquet(folder / "membership_daily.parquet")
+    with pytest.raises(ValueError, match="line up"):
+        load_stocks(tmp_path)
+
+
+def test_stock_files_must_be_fetched_first(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="fetch_data"):
+        load_stocks(tmp_path)
+    with pytest.raises(FileNotFoundError, match="fetch_data"):
+        stock_coverage(tmp_path)
